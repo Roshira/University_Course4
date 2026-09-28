@@ -1,0 +1,11 @@
+# Альтернативний запуск MySQL через Docker:  docker compose up -d
+services:
+  mysql:
+    image: mysql:8.4
+    command: --mysql-native-password=ON --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./sql:/docker-entrypoint-initdb.d:ro
