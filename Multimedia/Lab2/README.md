@@ -58,10 +58,3 @@ python main.py
 Гучність зі слайдера переводиться у квадратичну залежність, бо людина сприймає гучність
 нелінійно. Поки користувач тягне повзунок прогресу, позиція з плеєра не оновлюється,
 перемотування відбувається після відпускання кнопки миші.
-
-## Приклади посилань
-
-- https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/360/Big_Buck_Bunny_360_10s_1MB.mp4
-- https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.webm
-- https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8
-- https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3
