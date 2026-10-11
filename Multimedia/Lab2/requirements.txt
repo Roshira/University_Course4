@@ -1,0 +1,4 @@
+PySide6>=6.5
+# тільки для samples/generate_samples.py
+av>=12
+numpy>=1.26
