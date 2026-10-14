@@ -3,11 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QSettings, QSize, Qt, QTimer
-from PySide6.QtGui import QAction, QCloseEvent, QDragEnterEvent, QDropEvent, QFont, QIcon, QKeySequence
+from PySide6.QtGui import QAction, QCloseEvent, QDragEnterEvent, QDropEvent, QKeySequence
 from PySide6.QtWidgets import (
     QComboBox,
     QDockWidget,
     QFileDialog,
+    QGridLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -17,7 +18,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QSlider,
     QStackedWidget,
-    QStyle,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -25,8 +25,16 @@ from PySide6.QtWidgets import (
 
 from ..player import MediaStatus, PlaybackState, PlayerController
 from ..playlist import MediaItem, Playlist, RepeatMode
-from ..utils import PLAYLIST_EXTENSIONS, format_time, is_supported_file, is_url, open_file_filter
-from .widgets import InfoView, SeekSlider, VideoView
+from ..utils import (
+    PLAYLIST_EXTENSIONS,
+    describe_source,
+    format_time,
+    is_supported_file,
+    is_url,
+    open_file_filter,
+)
+from . import icons
+from .widgets import ROLE_CURRENT, ROLE_INFO, InfoView, PlaylistDelegate, SeekSlider, VideoView
 
 APP_TITLE = "Медіаплеєр"
 SEEK_STEP_MS = 10_000
@@ -35,11 +43,12 @@ RESTART_THRESHOLD_MS = 3_000
 PLAYBACK_RATES = (0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0)
 
 EXAMPLE_URLS = (
-    "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/360/Big_Buck_Bunny_360_10s_1MB.mp4",
-    "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.webm",
-    "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
-    "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3",
-    "https://upload.wikimedia.org/wikipedia/commons/c/c8/Example.ogg",
+    "https://test-videos.co.uk/vids/jellyfish/mp4/h264/720/Jellyfish_720_10s_1MB.mp4",
+    "https://test-videos.co.uk/vids/sintel/mp4/h264/720/Sintel_720_10s_1MB.mp4",
+    "https://demo.unified-streaming.com/k8s/features/stable/video/tears-of-steel/tears-of-steel.ism/.m3u8"
+    "?filter=(type!=%22video%22)||(systemBitrate%3E1200000)",
+    "https://upload.wikimedia.org/wikipedia/commons/2/22/Volcano_Lava_Sample.webm",
+    "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-8.mp3",
 )
 
 REPEAT_LABELS = {
@@ -71,14 +80,11 @@ class MainWindow(QMainWindow):
         self._update_transport()
 
 
-    def _icon(self, name: str) -> QIcon:
-        return self.style().standardIcon(getattr(QStyle.StandardPixmap, name))
-
     def _action(self, text: str, slot, shortcut=None, icon: str | None = None,
                 checkable: bool = False) -> QAction:
         action = QAction(text, self)
         if icon:
-            action.setIcon(self._icon(icon))
+            action.setIcon(icons.icon(icon))
         if shortcut:
             seqs = shortcut if isinstance(shortcut, (list, tuple)) else [shortcut]
             action.setShortcuts([QKeySequence(s) for s in seqs])
@@ -90,26 +96,27 @@ class MainWindow(QMainWindow):
 
     def _create_actions(self) -> None:
         a = self._action
-        self.act_open = a("Відкрити файл...", self.open_files, QKeySequence.StandardKey.Open, "SP_DialogOpenButton")
-        self.act_open_url = a("Відкрити URL...", self.open_url, "Ctrl+U", "SP_DriveNetIcon")
-        self.act_open_folder = a("Відкрити теку...", self.open_folder, "Ctrl+Shift+O", "SP_DirOpenIcon")
-        self.act_save_pl = a("Зберегти список (M3U)...", self.save_playlist, "Ctrl+S", "SP_DialogSaveButton")
+        self.act_open = a("Відкрити файл...", self.open_files, QKeySequence.StandardKey.Open, "folder")
+        self.act_open_url = a("Відкрити URL...", self.open_url, "Ctrl+U", "link")
+        self.act_open_folder = a("Відкрити теку...", self.open_folder, "Ctrl+Shift+O", "folder")
+        self.act_save_pl = a("Зберегти список (M3U)...", self.save_playlist, "Ctrl+S", "save")
         self.act_quit = a("Вихід", self.close, "Ctrl+Q")
 
-        self.act_play = a("Відтворити / Пауза", self.player.toggle_play, ["Space", "K"], "SP_MediaPlay")
-        self.act_stop = a("Стоп", self.player.stop, "S", "SP_MediaStop")
-        self.act_back = a("Назад на 10 с", lambda: self.player.skip(-SEEK_STEP_MS), "Left", "SP_MediaSeekBackward")
-        self.act_fwd = a("Вперед на 10 с", lambda: self.player.skip(SEEK_STEP_MS), "Right", "SP_MediaSeekForward")
-        self.act_prev = a("Попередній трек", self.play_previous, ["PgUp", "P"], "SP_MediaSkipBackward")
-        self.act_next = a("Наступний трек", self.play_next, ["PgDown", "N"], "SP_MediaSkipForward")
+        self.act_play = a("Відтворити / Пауза", self.player.toggle_play, ["Space", "K"])
+        self.act_play.setIcon(icons.icon("play", icons.ON_ACCENT))
+        self.act_stop = a("Стоп", self.player.stop, "S", "stop")
+        self.act_back = a("Назад на 10 с", lambda: self.player.skip(-SEEK_STEP_MS), "Left", "back")
+        self.act_fwd = a("Вперед на 10 с", lambda: self.player.skip(SEEK_STEP_MS), "Right", "forward")
+        self.act_prev = a("Попередній трек", self.play_previous, ["PgUp", "P"], "prev")
+        self.act_next = a("Наступний трек", self.play_next, ["PgDown", "N"], "next")
 
         self.act_vol_up = a("Гучніше", lambda: self.change_volume(VOLUME_STEP), "Up")
         self.act_vol_down = a("Тихіше", lambda: self.change_volume(-VOLUME_STEP), "Down")
-        self.act_mute = a("Вимкнути звук", self.toggle_mute, "M", "SP_MediaVolume", checkable=True)
+        self.act_mute = a("Вимкнути звук", self.toggle_mute, "M", "volume", checkable=True)
 
-        self.act_repeat = a(REPEAT_LABELS[RepeatMode.OFF], self.cycle_repeat, "R", "SP_BrowserReload")
-        self.act_shuffle = a("Випадковий порядок", self.toggle_shuffle, "H", "SP_ArrowRight", checkable=True)
-        self.act_fullscreen = a("Повний екран", self.toggle_fullscreen, ["F", "F11"], "SP_TitleBarMaxButton")
+        self.act_repeat = a(REPEAT_LABELS[RepeatMode.OFF], self.cycle_repeat, "R", "repeat")
+        self.act_shuffle = a("Випадковий порядок", self.toggle_shuffle, "H", "shuffle", checkable=True)
+        self.act_fullscreen = a("Повний екран", self.toggle_fullscreen, ["F", "F11"], "fullscreen")
         self.act_exit_fullscreen = a("Вийти з повного екрана", self.exit_fullscreen, "Esc")
 
     def _tool_button(self, action: QAction, size: int = 22) -> QToolButton:
@@ -132,9 +139,11 @@ class MainWindow(QMainWindow):
         self.video_view.clicked.connect(self.player.toggle_play)
         self.info_view.doubleClicked.connect(self.toggle_fullscreen)
 
-        self.now_playing = QLabel("-")
+        self.now_playing = QLabel("Нічого не відтворюється")
         self.now_playing.setObjectName("NowPlaying")
         self.now_playing.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.now_meta = QLabel("")
+        self.now_meta.setObjectName("NowMeta")
 
         self.time_label = QLabel(format_time(0))
         self.duration_label = QLabel(format_time(0))
@@ -148,23 +157,29 @@ class MainWindow(QMainWindow):
         self.seek_slider.sliderReleased.connect(self._on_seek_released)
 
         seek_row = QHBoxLayout()
+        seek_row.setSpacing(10)
         seek_row.addWidget(self.time_label)
         seek_row.addWidget(self.seek_slider, 1)
         seek_row.addWidget(self.duration_label)
 
-        controls = QHBoxLayout()
-        controls.setSpacing(2)
+        left = QHBoxLayout()
+        left.setSpacing(2)
         for action in (self.act_open, self.act_open_url):
-            controls.addWidget(self._tool_button(action))
-        controls.addSpacing(16)
-        for action in (self.act_prev, self.act_back):
-            controls.addWidget(self._tool_button(action))
-        self.play_button = self._tool_button(self.act_play, 34)
+            left.addWidget(self._tool_button(action))
+        left.addStretch(1)
+
+        center = QHBoxLayout()
+        center.setSpacing(6)
+        for action in (self.act_stop, self.act_prev, self.act_back):
+            center.addWidget(self._tool_button(action))
+        self.play_button = self._tool_button(self.act_play, 28)
         self.play_button.setObjectName("PlayButton")
-        controls.addWidget(self.play_button)
-        for action in (self.act_stop, self.act_fwd, self.act_next):
-            controls.addWidget(self._tool_button(action))
-        controls.addSpacing(16)
+        self.play_button.setFixedSize(52, 52)
+        center.addSpacing(6)
+        center.addWidget(self.play_button)
+        center.addSpacing(6)
+        for action in (self.act_fwd, self.act_next):
+            center.addWidget(self._tool_button(action))
 
         self.speed_combo = QComboBox()
         self.speed_combo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -175,29 +190,44 @@ class MainWindow(QMainWindow):
         self.speed_combo.currentIndexChanged.connect(
             lambda i: self.player.set_rate(self.speed_combo.itemData(i))
         )
-        controls.addWidget(self.speed_combo)
-        controls.addStretch(1)
 
-        controls.addWidget(self._tool_button(self.act_mute))
         self.volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.volume_slider.setObjectName("VolumeSlider")
         self.volume_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.volume_slider.setRange(0, 100)
-        self.volume_slider.setFixedWidth(120)
+        self.volume_slider.setFixedWidth(110)
         self.volume_slider.setToolTip("Гучність (↑ / ↓)")
         self.volume_slider.valueChanged.connect(self._on_volume_slider)
         self.volume_label = QLabel()
         self.volume_label.setObjectName("TimeLabel")
         self.volume_label.setMinimumWidth(40)
-        controls.addWidget(self.volume_slider)
-        controls.addWidget(self.volume_label)
-        controls.addSpacing(8)
-        controls.addWidget(self._tool_button(self.act_fullscreen))
+
+        right = QHBoxLayout()
+        right.setSpacing(4)
+        right.addStretch(1)
+        right.addWidget(self.speed_combo)
+        right.addSpacing(10)
+        right.addWidget(self._tool_button(self.act_mute))
+        right.addWidget(self.volume_slider)
+        right.addWidget(self.volume_label)
+        right.addWidget(self._tool_button(self.act_fullscreen))
+
+        controls = QGridLayout()
+        controls.setContentsMargins(0, 0, 0, 0)
+        controls.addLayout(left, 0, 0)
+        controls.addLayout(center, 0, 1)
+        controls.addLayout(right, 0, 2)
+        controls.setColumnStretch(0, 1)
+        controls.setColumnStretch(2, 1)
 
         self.controls_panel = QWidget()
         self.controls_panel.setObjectName("ControlsPanel")
         panel_layout = QVBoxLayout(self.controls_panel)
-        panel_layout.setContentsMargins(10, 6, 10, 8)
+        panel_layout.setContentsMargins(18, 12, 18, 12)
+        panel_layout.setSpacing(6)
         panel_layout.addWidget(self.now_playing)
+        panel_layout.addWidget(self.now_meta)
+        panel_layout.addSpacing(2)
         panel_layout.addLayout(seek_row)
         panel_layout.addLayout(controls)
 
@@ -213,20 +243,23 @@ class MainWindow(QMainWindow):
         self.playlist_view = QListWidget()
         self.playlist_view.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.playlist_view.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self.playlist_view.setItemDelegate(PlaylistDelegate(self.playlist_view))
+        self.playlist_view.setMouseTracking(True)
+        self.playlist_view.setUniformItemSizes(True)
         self.playlist_view.itemDoubleClicked.connect(
             lambda item: self.play_index(self.playlist_view.row(item))
         )
 
-        act_remove = QAction(self._icon("SP_DialogDiscardButton"), "Видалити вибрані", self)
+        act_remove = QAction(icons.icon("remove"), "Видалити вибрані", self)
         act_remove.setShortcut(QKeySequence.StandardKey.Delete)
         act_remove.triggered.connect(self.remove_selected)
         self.addAction(act_remove)
-        act_clear = QAction(self._icon("SP_TrashIcon"), "Очистити список", self)
+        act_clear = QAction(icons.icon("trash"), "Очистити список", self)
         act_clear.triggered.connect(self.clear_playlist)
 
         buttons = QHBoxLayout()
         buttons.setSpacing(2)
-        for action in (self.act_open, self.act_open_url, act_remove, act_clear):
+        for action in (self.act_open, self.act_open_url, self.act_save_pl, act_remove, act_clear):
             buttons.addWidget(self._tool_button(action, 18))
         buttons.addStretch(1)
         self.repeat_button = self._tool_button(self.act_repeat, 18)
@@ -235,14 +268,17 @@ class MainWindow(QMainWindow):
 
         panel = QWidget()
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setContentsMargins(8, 4, 8, 8)
+        self.playlist_count = QLabel()
+        self.playlist_count.setObjectName("PlaylistCount")
+        layout.addWidget(self.playlist_count)
         layout.addWidget(self.playlist_view, 1)
         layout.addLayout(buttons)
 
         self.playlist_dock = QDockWidget("Список відтворення", self)
         self.playlist_dock.setObjectName("PlaylistDock")
         self.playlist_dock.setWidget(panel)
-        self.playlist_dock.setMinimumWidth(240)
+        self.playlist_dock.setMinimumWidth(280)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.playlist_dock)
 
         self.act_toggle_playlist = self.playlist_dock.toggleViewAction()
@@ -286,6 +322,7 @@ class MainWindow(QMainWindow):
         p.bufferProgressChanged.connect(self._on_buffer)
         p.errorOccurred.connect(self._on_error)
         p.mediaFinished.connect(lambda: QTimer.singleShot(0, self._on_finished))
+        p.audioSamples.connect(self._on_audio_samples)
 
 
     def open_files(self) -> None:
@@ -303,13 +340,18 @@ class MainWindow(QMainWindow):
             self.add_sources([folder], play=True)
 
     def open_url(self) -> None:
-        url, ok = QInputDialog.getItem(
-            self, "Відкрити URL",
-            "Посилання на медіа (MP4, MP3, OGG, HLS .m3u8 тощо):",
-            list(EXAMPLE_URLS), 0, True,
-        )
-        url = url.strip()
-        if not ok or not url:
+        dialog = QInputDialog(self)
+        dialog.setWindowTitle("Відкрити URL")
+        dialog.setLabelText("Посилання на медіа (MP4, WebM, MP3, HLS .m3u8 тощо):")
+        dialog.setComboBoxItems(list(EXAMPLE_URLS))
+        dialog.setComboBoxEditable(True)
+        dialog.setOkButtonText("Відкрити")
+        dialog.setCancelButtonText("Скасувати")
+        dialog.resize(640, dialog.sizeHint().height())
+        if not dialog.exec():
+            return
+        url = dialog.textValue().strip()
+        if not url:
             return
         if not is_url(url):
             QMessageBox.warning(self, APP_TITLE, f"Некоректна адреса:\n{url}")
@@ -369,6 +411,7 @@ class MainWindow(QMainWindow):
         self.time_label.setText(format_time(0))
         self.duration_label.setText("--:--")
         self.now_playing.setText(item.title)
+        self.now_meta.setText(describe_source(item.source))
         self.setWindowTitle(f"{item.title} - {APP_TITLE}")
         self.stack.setCurrentWidget(self.info_view)
         self.info_view.show_loading(item.title)
@@ -408,26 +451,33 @@ class MainWindow(QMainWindow):
         self.player.unload()
         self.stack.setCurrentWidget(self.info_view)
         self.info_view.show_idle()
-        self.now_playing.setText("-")
+        self.now_playing.setText("Нічого не відтворюється")
+        self.now_meta.setText("")
         self.setWindowTitle(APP_TITLE)
         self._on_duration(0)
         self._on_position(0)
 
     def _refresh_playlist(self) -> None:
         self.playlist_view.clear()
-        bold = QFont()
-        bold.setBold(True)
         for i, item in enumerate(self.playlist.items):
-            prefix = "▶ " if i == self.playlist.current_index else ""
-            suffix = " (URL)" if item.is_remote else ""
-            row = QListWidgetItem(f"{prefix}{i + 1}. {item.title}{suffix}")
+            row = QListWidgetItem(item.title)
             row.setToolTip(item.source)
-            if i == self.playlist.current_index:
-                row.setFont(bold)
+            row.setData(ROLE_INFO, describe_source(item.source))
+            row.setData(ROLE_CURRENT, i == self.playlist.current_index)
             self.playlist_view.addItem(row)
         if self.playlist.current is not None:
             self.playlist_view.scrollToItem(self.playlist_view.item(self.playlist.current_index))
+        count = len(self.playlist)
+        self.playlist_count.setText(f"{count} {self._tracks_word(count)}" if count else "Список порожній")
         self._update_transport()
+
+    @staticmethod
+    def _tracks_word(n: int) -> str:
+        if n % 10 == 1 and n % 100 != 11:
+            return "трек"
+        if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+            return "треки"
+        return "треків"
 
     def cycle_repeat(self) -> None:
         self.playlist.repeat = self.playlist.repeat.next()
@@ -441,7 +491,13 @@ class MainWindow(QMainWindow):
         self.act_repeat.setText(REPEAT_LABELS[mode])
         self.act_repeat.setToolTip(f"{REPEAT_LABELS[mode]} (R)")
         self.repeat_button.setProperty("active", mode is not RepeatMode.OFF)
+        color = icons.TEXT if mode is RepeatMode.OFF else icons.ACCENT
+        self.act_repeat.setIcon(icons.icon("repeat", color))
         self.repeat_button.setText("1" if mode is RepeatMode.ONE else "")
+        self.repeat_button.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextBesideIcon if mode is RepeatMode.ONE
+            else Qt.ToolButtonStyle.ToolButtonIconOnly
+        )
         self.repeat_button.style().unpolish(self.repeat_button)
         self.repeat_button.style().polish(self.repeat_button)
 
@@ -449,6 +505,7 @@ class MainWindow(QMainWindow):
     def _on_volume_slider(self, value: int) -> None:
         self.player.set_volume(value)
         self.volume_label.setText(f"{value}%")
+        self._update_volume_icon()
         if value > 0 and self.player.muted:
             self.act_mute.setChecked(False)
             self.toggle_mute()
@@ -460,8 +517,18 @@ class MainWindow(QMainWindow):
     def toggle_mute(self) -> None:
         muted = self.act_mute.isChecked()
         self.player.set_muted(muted)
-        self.act_mute.setIcon(self._icon("SP_MediaVolumeMuted" if muted else "SP_MediaVolume"))
         self.act_mute.setText("Увімкнути звук" if muted else "Вимкнути звук")
+        self._update_volume_icon()
+
+    def _update_volume_icon(self) -> None:
+        value = self.volume_slider.value()
+        if self.act_mute.isChecked() or value == 0:
+            name = "mute"
+        elif value < 50:
+            name = "volume_low"
+        else:
+            name = "volume"
+        self.act_mute.setIcon(icons.icon(name, checked_color=icons.TEXT))
 
 
     def _on_seek_pressed(self) -> None:
@@ -487,7 +554,7 @@ class MainWindow(QMainWindow):
 
     def _on_state(self, state: PlaybackState) -> None:
         playing = state is PlaybackState.PlayingState
-        self.act_play.setIcon(self._icon("SP_MediaPause" if playing else "SP_MediaPlay"))
+        self.act_play.setIcon(icons.icon("pause" if playing else "play", icons.ON_ACCENT))
         self.act_play.setText("Пауза" if playing else "Відтворити")
         if state is PlaybackState.StoppedState and not self._seeking:
             self._on_position(0)
@@ -528,7 +595,9 @@ class MainWindow(QMainWindow):
         if isinstance(artist, list):
             artist = ", ".join(map(str, artist))
         subtitle = " - ".join(str(x) for x in (artist, md.get("album")) if x)
-        self.now_playing.setText(f"{title} - {subtitle}" if subtitle else title)
+        self.now_playing.setText(title)
+        info = describe_source(item.source)
+        self.now_meta.setText(f"{subtitle}  |  {info}" if subtitle else info)
         if not self.player.has_video:
             cover = md.get("cover") or md.get("thumbnail")
             self.info_view.show_audio(title, subtitle or item.source, cover)
@@ -555,9 +624,13 @@ class MainWindow(QMainWindow):
         item = self.playlist.current
         source = item.source if item else ""
         self.statusBar().showMessage(f"Помилка: {message}", 10000)
-        self.info_view.show_audio("Помилка відтворення", message, None)
+        self.info_view.show_error(message)
         self.stack.setCurrentWidget(self.info_view)
         QMessageBox.warning(self, APP_TITLE, f"Не вдалося відтворити:\n{source}\n\n{message}")
+
+    def _on_audio_samples(self, samples, rate: int) -> None:
+        if self.stack.currentWidget() is self.info_view and self.info_view.spectrum.isVisible():
+            self.info_view.spectrum.feed(samples, rate)
 
     def _on_finished(self) -> None:
         index = self.playlist.next_index(auto=True)

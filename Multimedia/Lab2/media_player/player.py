@@ -2,12 +2,27 @@ from __future__ import annotations
 
 from PySide6.QtCore import QObject, QUrl, Signal
 from PySide6.QtGui import QImage
-from PySide6.QtMultimedia import QAudioOutput, QMediaMetaData, QMediaPlayer
+from PySide6.QtMultimedia import (
+    QAudioBuffer,
+    QAudioBufferOutput,
+    QAudioFormat,
+    QAudioOutput,
+    QMediaMetaData,
+    QMediaPlayer,
+)
 
+from .spectrum import to_mono_float
 from .utils import is_url
 
 PlaybackState = QMediaPlayer.PlaybackState
 MediaStatus = QMediaPlayer.MediaStatus
+
+_SAMPLE_FORMATS = {
+    QAudioFormat.SampleFormat.Float: "float",
+    QAudioFormat.SampleFormat.Int16: "int16",
+    QAudioFormat.SampleFormat.Int32: "int32",
+    QAudioFormat.SampleFormat.UInt8: "uint8",
+}
 
 
 class PlayerController(QObject):
@@ -21,12 +36,16 @@ class PlayerController(QObject):
     metaDataChanged = Signal()
     errorOccurred = Signal(str)
     mediaFinished = Signal()
+    audioSamples = Signal(object, int)
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._player = QMediaPlayer(self)
         self._audio = QAudioOutput(self)
         self._player.setAudioOutput(self._audio)
+        self._buffers = QAudioBufferOutput(self)
+        self._player.setAudioBufferOutput(self._buffers)
+        self._buffers.audioBufferReceived.connect(self._on_audio_buffer)
         self._volume = 70
 
         p = self._player
@@ -151,6 +170,14 @@ class PlayerController(QObject):
                 result[name] = text
         return result
 
+
+    def _on_audio_buffer(self, buffer: QAudioBuffer) -> None:
+        fmt = buffer.format()
+        kind = _SAMPLE_FORMATS.get(fmt.sampleFormat())
+        if kind is None or not buffer.isValid():
+            return
+        samples = to_mono_float(bytes(buffer.constData()), kind, fmt.channelCount())
+        self.audioSamples.emit(samples, fmt.sampleRate())
 
     def _on_media_status(self, status: MediaStatus) -> None:
         self.mediaStatusChanged.emit(status)

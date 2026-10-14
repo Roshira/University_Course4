@@ -8,14 +8,17 @@ Qt Multimedia використовує FFmpeg, тому окремо стави�
 ## Запуск
 
 ```
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 python main.py
 ```
 
 Можна одразу передати файл або посилання: `python main.py samples/demo.mp4`
 
 Тестові файли лежать у папці `samples`, їх можна створити заново командою
-`python samples/generate_samples.py` (потрібні av та numpy).
+`python samples/generate_samples.py` (потрібні av та numpy). Генератор створює мелодію
+(синусоїди з огинаючою) і три відео, кадри яких малює QPainter:
+`demo.mp4` - Сонячна система, `demo.webm` - спектр мелодії, синхронний зі звуком,
+`demo.mkv` - зворотний відлік.
 
 Тести: `python -m unittest discover tests`
 
@@ -39,8 +42,9 @@ python main.py
 - швидкість відтворення від 0.25x до 2x
 - повноекранний режим (F, подвійний клік, Esc - вихід)
 - для аудіо показується назва, виконавець і обкладинка, якщо є
+- візуалізатор спектра для аудіо: семпли з QAudioBufferOutput, FFT (numpy), 40 смуг у логарифмічній шкалі частот
 - у рядку стану показуються роздільна здатність і кодеки
-- темна тема
+- темна тема, власні векторні іконки (SVG), плейлист з типом кожного файлу
 - налаштування (гучність, розмір вікна, список) зберігаються між запусками
 
 ## Структура
@@ -49,8 +53,10 @@ python main.py
 - `media_player/utils.py` - форматування часу, перевірка URL і розширень
 - `media_player/playlist.py` - список відтворення, режими повтору, m3u
 - `media_player/player.py` - клас PlayerController, обгортка над QMediaPlayer
+- `media_player/spectrum.py` - розрахунок спектра (FFT) для візуалізатора
 - `media_player/ui/main_window.py` - головне вікно
-- `media_player/ui/widgets.py` - слайдер перемотування, відео, екран для аудіо
+- `media_player/ui/widgets.py` - слайдер перемотування, відео, екран для аудіо, візуалізатор, рядки плейлиста
+- `media_player/ui/icons.py` - іконки у форматі SVG
 - `media_player/ui/theme.py` - тема оформлення
 - `tests/test_core.py` - тести
 - `samples/` - тестові медіафайли

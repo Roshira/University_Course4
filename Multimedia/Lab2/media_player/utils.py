@@ -24,9 +24,19 @@ def is_url(text: str) -> bool:
     return parsed.scheme.lower() in _URL_SCHEMES and bool(parsed.netloc)
 
 
+def _path_of(source: str) -> str:
+    return unquote(urlparse(source).path) if is_url(source) else source
+
+
+def suffix_of(source: str) -> str:
+    name = Path(_path_of(source)).name
+    if "." not in name:
+        return ""
+    return "." + name.rsplit(".", 1)[1].lower()
+
+
 def media_kind(source: str) -> str | None:
-    path = urlparse(source).path if is_url(source) else source
-    suffix = Path(path).suffix.lower()
+    suffix = suffix_of(source)
     if suffix in AUDIO_EXTENSIONS:
         return "audio"
     if suffix in VIDEO_EXTENSIONS:
@@ -40,10 +50,25 @@ def is_supported_file(path: str) -> bool:
 
 def display_name(source: str) -> str:
     if is_url(source):
-        parsed = urlparse(source)
-        name = unquote(Path(parsed.path).name)
-        return name or parsed.netloc
+        path = Path(_path_of(source))
+        name = path.name
+        if not name or name.startswith("."):
+            name = path.parent.name
+        return name or urlparse(source).netloc
     return Path(source).name or source
+
+
+def describe_source(source: str) -> str:
+    remote = is_url(source)
+    suffix = suffix_of(source)
+    if remote and suffix in PLAYLIST_EXTENSIONS:
+        return "Мережа, HLS-потік"
+    kind = media_kind(source)
+    ext = suffix.lstrip(".").upper()
+    label = {"audio": "аудіо", "video": "відео"}.get(kind, "медіа")
+    if remote:
+        return f"Мережа, {label} {ext}".rstrip()
+    return f"{label.capitalize()}, {ext}" if ext else label.capitalize()
 
 
 def open_file_filter() -> str:

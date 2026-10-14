@@ -2,8 +2,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 from media_player.playlist import MediaItem, Playlist, RepeatMode
-from media_player.utils import display_name, format_time, is_url, media_kind
+from media_player.spectrum import FFT_SIZE, band_edges, band_levels, to_mono_float
+from media_player.utils import describe_source, display_name, format_time, is_url, media_kind
 
 
 class UtilsTest(unittest.TestCase):
@@ -28,6 +31,35 @@ class UtilsTest(unittest.TestCase):
     def test_display_name(self):
         self.assertEqual(display_name("https://x.org/a/My%20Song.mp3"), "My Song.mp3")
         self.assertEqual(display_name("https://x.org/"), "x.org")
+        self.assertEqual(display_name("https://x.org/film.ism/.m3u8"), "film.ism")
+
+    def test_describe_source(self):
+        self.assertEqual(describe_source("song.mp3"), "Аудіо, MP3")
+        self.assertEqual(describe_source("clip.webm"), "Відео, WEBM")
+        self.assertEqual(describe_source("https://x.org/v/clip.mp4"), "Мережа, відео MP4")
+        self.assertEqual(describe_source("https://x.org/film.ism/.m3u8"), "Мережа, HLS-потік")
+
+
+class SpectrumTest(unittest.TestCase):
+    def test_sine_peaks_in_its_band(self):
+        rate = 48_000
+        t = np.arange(FFT_SIZE) / rate
+        tone = np.sin(2 * np.pi * 1000 * t).astype(np.float32)
+        levels = band_levels(tone, rate, bands=32)
+        edges = band_edges(32, rate)
+        band = int(np.searchsorted(edges, 1000) - 1)
+        self.assertEqual(int(np.argmax(levels)), band)
+        self.assertGreater(levels[band], 0.9)
+
+    def test_silence_is_zero(self):
+        self.assertEqual(band_levels(np.zeros(FFT_SIZE, dtype=np.float32), 44_100).max(), 0.0)
+
+    def test_to_mono_float(self):
+        stereo = np.array([16384, -16384, 32767, 32767], dtype=np.int16).tobytes()
+        mono = to_mono_float(stereo, "int16", 2)
+        self.assertEqual(mono.shape, (2,))
+        self.assertAlmostEqual(float(mono[0]), 0.0)
+        self.assertAlmostEqual(float(mono[1]), 1.0, places=3)
 
 
 def make_playlist(n: int) -> Playlist:
