@@ -45,6 +45,7 @@ comparatorsOf n (p, k) = [ (a, a + k) | a <- [0 .. n - k - 1], isComparator n p 
 runRange :: IOUArray Int Int -> Int -> Int -> Int -> Int -> Int -> IO ()
 runRange arr n p k lo hi = go lo
   where
+    go :: Int -> IO ()
     go a
       | a >= hi = pure ()
       | isComparator n p k a = do
