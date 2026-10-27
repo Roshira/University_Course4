@@ -1,0 +1,5 @@
+PySide6>=6.5
+numpy>=1.26
+Pillow>=10
+# тільки для графіків у experiments.py
+matplotlib>=3.7
