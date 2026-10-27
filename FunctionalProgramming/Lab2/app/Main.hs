@@ -1,6 +1,7 @@
 module Main (main) where
 
 import Batcher
+import Console (setupConsole)
 import Control.Concurrent (getNumCapabilities, setNumCapabilities)
 import Control.Monad (forM_, when)
 import Data.Array.IO (IOUArray, newListArray, getElems)
@@ -43,17 +44,24 @@ askInt s ok = do
     Just v | ok v -> pure v
     _ -> putStrLn "  Некоректне значення, спробуйте ще раз." >> askInt s ok
 
--- | Інтерактивний режим: масив і k вводяться з клавіатури.
-interactive :: IO ()
-interactive = do
-  putStrLn "Сортування Бетчера (обмінне сортування зі злиттям) на k потоках"
+-- | Введення масиву; при помилці — повторний запит.
+askArray :: IO [Int]
+askArray = do
   line <- prompt "Введіть масив цілих чисел через пробіл (або порожній рядок — згенерувати випадковий): "
-  xs <- case traverse readMaybe (words line) of
+  case traverse readMaybe (words line) of
     Just ys@(_:_) -> pure ys
     Just [] -> do
       n <- askInt "Розмір випадкового масиву n = " (> 0)
       pure (randomList 42 n)
-    Nothing -> putStrLn "Не вдалося розібрати числа." >> fail "bad input"
+    Nothing -> do
+      putStrLn "  Не вдалося розібрати числа (потрібні цілі числа через пробіл), спробуйте ще раз."
+      askArray
+
+-- | Інтерактивний режим: масив і k вводяться з клавіатури.
+interactive :: IO ()
+interactive = do
+  putStrLn "Сортування Бетчера (обмінне сортування зі злиттям) на k потоках"
+  xs <- askArray
   k <- askInt "Кількість потоків k = " (> 0)
   ensureCaps k
   (ys, t) <- runOnce k xs
@@ -97,8 +105,7 @@ bench n = do
 
 main :: IO ()
 main = do
-  hSetEncoding stdout utf8
-  hSetEncoding stdin utf8
+  setupConsole
   args <- getArgs
   case args of
     ["bench"]    -> bench 1000000

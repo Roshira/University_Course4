@@ -16,6 +16,7 @@ library
   exposed-modules: Text.Types
                    Text.Parser
                    Text.Task
+                   Console
 
 executable lab3
   import:          shared

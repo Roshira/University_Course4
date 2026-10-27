@@ -15,6 +15,7 @@ library
   import:          shared
   hs-source-dirs:  src
   exposed-modules: Batcher
+                   Console
 
 executable lab2
   import:          shared

@@ -8,6 +8,7 @@ import Text.Read (readMaybe)
 import Text.Parser (parseText)
 import Text.Task
 import Text.Types
+import Console (setupConsole)
 
 data Options = Options
   { optFile   :: FilePath
@@ -35,7 +36,7 @@ readUtf8 path = do
 
 main :: IO ()
 main = do
-  hSetEncoding stdout utf8
+  setupConsole
   args <- getArgs
   opts <- case parseArgs args (Options "data/textbook.txt" False 80 False) of
     Just o  -> pure o

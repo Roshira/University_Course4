@@ -3,7 +3,7 @@ module Main (main) where
 import Prelude hiding (Word)
 import Control.Monad (unless)
 import System.Exit (exitFailure)
-import System.IO (hSetEncoding, stdout, utf8)
+import Console (setupConsole)
 import Text.Parser
 import Text.Task
 import Text.Types
@@ -21,7 +21,7 @@ sentencesOf s = let Text ss = parseText s in map renderSentence ss
 
 main :: IO ()
 main = do
-  hSetEncoding stdout utf8
+  setupConsole
   rs <- sequence
     [ check "класифікація символів" $
         map classify "я7 ,'+" == [Letter 'я', Digit '7', Space, Punct ',', Joiner '\'', Other '+']

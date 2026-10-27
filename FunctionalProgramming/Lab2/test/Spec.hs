@@ -4,7 +4,7 @@ import Batcher
 import Control.Monad (forM, unless)
 import Data.List (sort, nub)
 import System.Exit (exitFailure)
-import System.IO (hSetEncoding, stdout, utf8)
+import Console (setupConsole)
 
 lcg :: Int -> [Int]
 lcg = tail . iterate (\x -> (x * 1103515245 + 12345) `mod` 2147483648)
@@ -16,7 +16,7 @@ check name ok = do
 
 main :: IO ()
 main = do
-  hSetEncoding stdout utf8
+  setupConsole
   -- 1. Компаратори одного етапу не перетинаються (умова паралельності).
   r1 <- check "компаратори кожного етапу не перетинаються (n = 1..70)" $
     and [ let cs = comparatorsOf n st
