@@ -1,0 +1,28 @@
+## Ігноруємо папки зборки (НАЙВАЖЛИВІШЕ) ##
+[Bb]in/
+[Oo]bj/
+
+## Налаштування IDE (Visual Studio, Rider, VS Code) ##
+.vs/
+.idea/
+.vscode/
+*.user
+*.suo
+*.sln.docstates
+
+## Логи та тимчасові файли ##
+*.log
+*.err
+crash_dumps/
+TestResults/
+
+## Системні файли macOS / Windows ##
+.DS_Store
+Thumbs.db
+
+## Файли бази даних (якщо використовуєте локальний SQLite, хоча у вас PostgreSQL) ##
+*.db
+*.db-shm
+*.db-wal
+
+*.json

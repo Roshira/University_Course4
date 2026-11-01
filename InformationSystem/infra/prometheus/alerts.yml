@@ -1,0 +1,57 @@
+groups:
+  - name: database
+    rules:
+      - alert: PostgresDown
+        expr: pg_up == 0 or absent(pg_up)
+        for: 30s
+        labels: { severity: critical }
+        annotations: { summary: "PostgreSQL недоступний" }
+      - alert: TooManyConnections
+        expr: sum(pg_stat_database_numbackends) > 80
+        for: 1m
+        labels: { severity: warning }
+        annotations: { summary: "Забагато з'єднань з PostgreSQL ({{ $value }})" }
+      - alert: LowCacheHitRatio
+        expr: |
+          sum(rate(pg_stat_database_blks_hit{datname="telemetry"}[5m]))
+          / clamp_min(sum(rate(pg_stat_database_blks_hit{datname="telemetry"}[5m])) + sum(rate(pg_stat_database_blks_read{datname="telemetry"}[5m])), 1) < 0.9
+        for: 5m
+        labels: { severity: warning }
+        annotations: { summary: "Cache hit ratio нижче 90%" }
+      - alert: LongRunningQuery
+        expr: db_longest_running_query_seconds > 30
+        labels: { severity: warning }
+        annotations: { summary: "Запит виконується довше 30 с" }
+      - alert: DbWriteErrors
+        expr: increase(telemetry_events_write_errors_total[5m]) > 0
+        labels: { severity: warning }
+        annotations: { summary: "Помилки запису подій у БД" }
+
+  - name: pipeline
+    rules:
+      - alert: QueueBacklog
+        expr: sum(rabbitmq_queue_messages_ready{queue="telemetry.events"}) > 1000
+        for: 2m
+        labels: { severity: warning }
+        annotations: { summary: "Черга telemetry.events накопичує повідомлення ({{ $value }})" }
+      - alert: DeadLetters
+        expr: sum(rabbitmq_queue_messages_ready{queue="telemetry.events.dead"}) > 0
+        labels: { severity: warning }
+        annotations: { summary: "Є повідомлення в DLQ" }
+      - alert: NoEventsWritten
+        expr: sum(rate(telemetry_events_written_total[2m])) == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations: { summary: "Нові події не записуються в БД" }
+      - alert: ServiceDown
+        expr: up == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations: { summary: "Сервіс {{ $labels.job }} ({{ $labels.instance }}) недоступний" }
+
+  - name: security
+    rules:
+      - alert: BruteForceSuspected
+        expr: increase(auth_logins_total{result=~"failure|locked"}[5m]) > 10
+        labels: { severity: warning }
+        annotations: { summary: "Багато невдалих спроб входу в систему моніторингу" }

@@ -1,0 +1,8 @@
+# Файли, що виконуються всередині Linux-контейнерів, мають бути з LF (інакше init.sh зламається на Windows)
+*.sh            text eol=lf
+*.conf          text eol=lf
+*.alloy         text eol=lf
+*.yml           text eol=lf
+*.py            text eol=lf
+Dockerfile      text eol=lf
+enabled_plugins text eol=lf

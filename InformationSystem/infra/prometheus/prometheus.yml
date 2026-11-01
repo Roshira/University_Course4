@@ -1,0 +1,44 @@
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: prometheus
+    metrics_path: /prometheus/metrics
+    static_configs: [{ targets: ["localhost:9090"] }]
+
+  # --- СУБД
+  - job_name: postgres-exporter        # стандартні метрики PostgreSQL (pg_stat_database, ...)
+    static_configs: [{ targets: ["postgres-exporter:9187"] }]
+  - job_name: db-monitor               # власний програмний моніторинг (Python + SQL)
+    static_configs: [{ targets: ["db-monitor:8000"] }]
+
+  # --- застосунок
+  - job_name: telemetry-api            # ASP.NET Core (prometheus-net)
+    static_configs: [{ targets: ["telemetry-api:8080"] }]
+  - job_name: traffic-generator
+    static_configs: [{ targets: ["traffic-generator:8000"] }]
+  - job_name: ingest-worker            # кілька реплік -> знаходимо всі через DNS
+    dns_sd_configs:
+      - names: ["ingest-worker"]
+        type: A
+        port: 8000
+  - job_name: auth-server
+    static_configs: [{ targets: ["auth-server:8000"] }]
+
+  # --- брокер
+  - job_name: rabbitmq
+    static_configs: [{ targets: ["rabbitmq:15692"] }]
+
+  # --- сам стек спостереження
+  - job_name: loki
+    static_configs: [{ targets: ["loki:3100"] }]
+  - job_name: tempo
+    static_configs: [{ targets: ["tempo:3200"] }]
+  - job_name: alloy
+    static_configs: [{ targets: ["alloy:12345"] }]
+  - job_name: grafana
+    static_configs: [{ targets: ["grafana:3000"] }]
