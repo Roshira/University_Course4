@@ -15,6 +15,13 @@ public static class AppMetrics
     /// <summary>ActivitySource для власних спанів (видно у Grafana Tempo).</summary>
     public static readonly ActivitySource Tracer = new("TelemetrySystem.Api");
 
+    /// <summary>Типи подій, які шле tracker.js. Решта рахується як "other", інакше будь-хто через
+    /// публічний /api/telemetry/track міг би створити необмежену кількість часових рядів у Prometheus.</summary>
+    private static readonly HashSet<string> KnownEventTypes = new() { "page_view", "click" };
+
+    public static string EventTypeLabel(string? eventType) =>
+        eventType is not null && KnownEventTypes.Contains(eventType) ? eventType : "other";
+
     public static readonly Counter EventsReceived = Metrics.CreateCounter(
         "telemetry_events_received_total",
         "Кількість подій, прийнятих ендпоінтом /api/telemetry/track",
@@ -28,9 +35,13 @@ public static class AppMetrics
         "telemetry_events_write_errors_total",
         "Кількість помилок запису подій у PostgreSQL");
 
+    public static readonly Counter EventsDropped = Metrics.CreateCounter(
+        "telemetry_events_dropped_total",
+        "Події, витіснені з переповненої внутрішньої черги (Channel, DropOldest) і не записані в БД");
+
     public static readonly Histogram DbWriteDuration = Metrics.CreateHistogram(
         "telemetry_db_write_duration_seconds",
-        "Тривалість INSERT однієї події в БД",
+        "Тривалість успішного INSERT однієї події в БД",
         new HistogramConfiguration { Buckets = Histogram.ExponentialBuckets(0.001, 2, 12) });
 
     public static readonly Gauge ChannelBacklog = Metrics.CreateGauge(

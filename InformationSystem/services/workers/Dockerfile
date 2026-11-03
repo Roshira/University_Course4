@@ -7,5 +7,8 @@ COPY workers/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY common/ ./common/
 COPY workers/*.py ./
+# воркери нічого не пишуть на диск — працюють від непривілейованого користувача
+RUN useradd --system --no-create-home --uid 10001 app
+USER app
 EXPOSE 8000
 CMD ["python", "generator.py"]

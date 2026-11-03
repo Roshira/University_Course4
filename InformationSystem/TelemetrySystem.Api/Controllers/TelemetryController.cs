@@ -33,9 +33,9 @@ public class TelemetryController : ControllerBase
             UserAgent = Request.Headers.UserAgent.ToString(),
             Timestamp = DateTime.UtcNow
         };
+        EventTraceContext.Remember(newEvent);
         await _channel.Writer.WriteAsync(newEvent);
-        AppMetrics.EventsReceived.WithLabels(string.IsNullOrEmpty(request.EventType) ? "unknown" : request.EventType).Inc();
-        AppMetrics.ChannelBacklog.Set(_channel.Reader.Count);
+        AppMetrics.EventsReceived.WithLabels(AppMetrics.EventTypeLabel(request.EventType)).Inc();
         return Ok();
     }
 

@@ -15,12 +15,13 @@ from opentelemetry.instrumentation.requests import RequestsInstrumentor
 from opentelemetry.trace import SpanKind, Status, StatusCode
 from prometheus_client import Counter, Histogram, start_http_server
 
-from common.obs import setup_logging, setup_tracing
+from common.obs import exit_on_sigterm, log_extra, setup_logging, setup_tracing
 
 SERVICE = "ingest-worker"
 log = setup_logging(SERVICE)
 tracer = setup_tracing(SERVICE)
 RequestsInstrumentor().instrument()
+exit_on_sigterm()
 
 API_URL = os.getenv("API_URL", "http://telemetry-api:8080")
 RABBIT_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@rabbitmq:5672/%2F")
@@ -37,46 +38,76 @@ END_TO_END = Histogram("consumer_end_to_end_seconds", "Затримка від �
 session = requests.Session()
 
 
+def publish_to(ch, queue: str, body: bytes, headers: dict):
+    """Публікація зі збереженням заголовків (traceparent, x-retries, x-error) — щоб у DLQ було видно причину."""
+    ch.basic_publish("", queue, body, pika.BasicProperties(
+        delivery_mode=2, content_type="application/json", headers=headers))
+
+
+def dead_letter(ch, body: bytes, headers: dict, reason: str):
+    publish_to(ch, DLQ, body, {**headers, "x-error": reason[:500]})
+
+
 def handle(ch, method, props, body):
-    ctx = propagate.extract(props.headers or {})
-    with tracer.start_as_current_span("rabbitmq.consume", context=ctx, kind=SpanKind.CONSUMER) as span, \
-            LATENCY.time():
+    headers = dict(props.headers or {})
+    ctx = propagate.extract(headers)
+    with tracer.start_as_current_span("rabbitmq.consume", context=ctx, kind=SpanKind.CONSUMER) as span,             LATENCY.time():
         span.set_attribute("messaging.system", "rabbitmq")
         span.set_attribute("messaging.destination.name", QUEUE)
         try:
             event = json.loads(body)
-            span.set_attribute("telemetry.event_type", event.get("eventType", ""))
+            if not isinstance(event, dict):
+                raise ValueError("message is not a JSON object")
+            span.set_attribute("telemetry.event_type", str(event.get("eventType", "")))
             resp = session.post(f"{API_URL}/api/telemetry/track", timeout=5,
-                                headers={"User-Agent": event.pop("userAgent", "ingest-worker")},
+                                headers={"User-Agent": str(event.pop("userAgent", "ingest-worker"))},
                                 json=event)
+            if 400 <= resp.status_code < 500:
+                # API відхилив саму подію — повтори нічого не змінять
+                PROCESSED.labels("rejected").inc()
+                span.set_status(Status(StatusCode.ERROR, f"HTTP {resp.status_code}"))
+                log.error(f"API rejected event with HTTP {resp.status_code}, moved to DLQ")
+                dead_letter(ch, body, headers, f"HTTP {resp.status_code}: {resp.text[:200]}")
+                ch.basic_ack(method.delivery_tag)
+                return
             resp.raise_for_status()
-            sent_at = (props.headers or {}).get("x-sent-at")
-            if sent_at:
-                END_TO_END.observe(max(0.0, time.time() - float(sent_at)))
+            try:
+                END_TO_END.observe(max(0.0, time.time() - float(headers["x-sent-at"])))
+            except (KeyError, TypeError, ValueError):
+                pass  # без коректного часу відправки затримку просто не рахуємо
             PROCESSED.labels("ok").inc()
             ch.basic_ack(method.delivery_tag)
-        except (ValueError, KeyError) as e:
-            # битий JSON — немає сенсу повторювати
-            PROCESSED.labels("invalid").inc()
-            span.set_status(Status(StatusCode.ERROR, str(e)))
-            log.error(f"Invalid message dropped to DLQ: {e}")
-            ch.basic_publish("", DLQ, body)
-            ch.basic_ack(method.delivery_tag)
         except requests.RequestException as e:
-            retries = int((props.headers or {}).get("x-retries", 0))
+            # API недоступний або 5xx — повертаємо в чергу, після MAX_RETRIES — у DLQ
+            retries = int(headers.get("x-retries", 0))
             span.set_status(Status(StatusCode.ERROR, str(e)))
             if retries < MAX_RETRIES:
                 PROCESSED.labels("retry").inc()
-                log.warning(f"API error, retry {retries + 1}/{MAX_RETRIES}: {e}")
-                headers = dict(props.headers or {})
-                headers["x-retries"] = retries + 1
-                ch.basic_publish("", QUEUE, body, pika.BasicProperties(delivery_mode=2, headers=headers))
+                log.warning(f"API error, retry {retries + 1}/{MAX_RETRIES}: {e!r}")
+                publish_to(ch, QUEUE, body, {**headers, "x-retries": retries + 1})
             else:
                 PROCESSED.labels("dead").inc()
-                log.error(f"Message moved to DLQ after {MAX_RETRIES} retries: {e}")
-                ch.basic_publish("", DLQ, body)
+                log.error(f"Message moved to DLQ after {MAX_RETRIES} retries: {e!r}")
+                dead_letter(ch, body, headers, repr(e))
             ch.basic_ack(method.delivery_tag)
             time.sleep(1)
+        except (ValueError, TypeError) as e:
+            # битий JSON або не об'єкт — немає сенсу повторювати
+            PROCESSED.labels("invalid").inc()
+            span.set_status(Status(StatusCode.ERROR, str(e)))
+            log.error(f"Invalid message dropped to DLQ: {e!r}")
+            dead_letter(ch, body, headers, repr(e))
+            ch.basic_ack(method.delivery_tag)
+        except pika.exceptions.AMQPError:
+            raise  # проблеми з'єднання обробляє main(): перепідключення, повідомлення повернеться в чергу
+        except Exception as e:
+            # будь-яка інша помилка не повинна зупиняти consumer і зациклювати повідомлення
+            PROCESSED.labels("invalid").inc()
+            span.set_status(Status(StatusCode.ERROR, repr(e)))
+            log.exception("Unexpected error, message moved to DLQ")
+            dead_letter(ch, body, headers, repr(e))
+            ch.basic_ack(method.delivery_tag)
+
 
 
 def wait_for_api():
@@ -102,10 +133,10 @@ def main():
             ch.queue_declare(queue=DLQ, durable=True)
             ch.basic_qos(prefetch_count=int(os.getenv("PREFETCH", "50")))
             ch.basic_consume(QUEUE, handle)
-            log.info("Consuming", extra={"extra_fields": {"queue": QUEUE}})
+            log.info("Consuming", extra=log_extra(queue=QUEUE))
             ch.start_consuming()
         except pika.exceptions.AMQPError as e:
-            log.warning(f"RabbitMQ connection problem: {e}; reconnecting in 3s")
+            log.warning(f"RabbitMQ connection problem: {e!r}; reconnecting in 3s")
             time.sleep(3)
 
 

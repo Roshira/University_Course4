@@ -8,6 +8,7 @@
 import json
 import logging
 import os
+import signal
 import sys
 from datetime import datetime, timezone
 
@@ -24,7 +25,7 @@ class JsonFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         payload = {
-            "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "ts": datetime.fromtimestamp(record.created, timezone.utc).isoformat(timespec="milliseconds"),
             "level": record.levelname.lower(),
             "service": self.service,
             "logger": record.name,
@@ -36,7 +37,8 @@ class JsonFormatter(logging.Formatter):
             payload["span_id"] = format(span_ctx.span_id, "016x")
         extra = getattr(record, "extra_fields", None)
         if extra:
-            payload.update(extra)
+            # службові поля (ts, level, trace_id ...) додаткові дані не перезаписують
+            payload.update({k: v for k, v in extra.items() if k not in payload})
         if record.exc_info:
             payload["exception"] = self.formatException(record.exc_info)
         return json.dumps(payload, ensure_ascii=False)
@@ -65,6 +67,13 @@ def setup_tracing(service: str) -> trace.Tracer:
         provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
     trace.set_tracer_provider(provider)
     return trace.get_tracer(service)
+
+
+def exit_on_sigterm() -> None:
+    """docker stop надсилає SIGTERM. Python як PID 1 у контейнері за замовчуванням його ігнорує,
+    тож через 10 с процес вбивається SIGKILL і останні спани не доходять до Tempo.
+    Перетворюємо SIGTERM на звичайний вихід: спрацює atexit і TracerProvider відправить спани."""
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
 
 def log_extra(**fields) -> dict:

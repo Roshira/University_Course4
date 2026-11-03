@@ -30,14 +30,24 @@ loki.source.docker "containers" {
 }
 
 loki.process "parse" {
-  // Python-сервіси пишуть {"level": "info", "trace_id": ...},
-  // ASP.NET Core JSON console — {"LogLevel": "Information", ...}
+  // Рівень логу береться з трьох форматів:
+  //   JSON  — Python-сервіси {"level": "info"}, ASP.NET Core {"LogLevel": "Information"};
+  //   logfmt — Grafana, Loki, Tempo, Alloy, Prometheus: level=warn;
+  //   PostgreSQL — "... ERROR:  ..." / "WARNING:" / "FATAL:".
   stage.json {
-    expressions = { level = "level || LogLevel" }
+    expressions = { json_level = "level || LogLevel" }
   }
+  // logfmt (level=warn) розбираємо регулярним виразом: stage.logfmt писав би помилку на кожен JSON-рядок
+  stage.regex {
+    expression = `(?:^|\s)level=(?P<lf_level>[A-Za-z]+)`
+  }
+  stage.regex {
+    expression = `\s(?P<pg_level>ERROR|FATAL|PANIC|WARNING):\s`
+  }
+  // зводимо до єдиного набору значень: error / warning / info / debug
   stage.template {
     source   = "level"
-    template = "{{ if .Value }}{{ ToLower .Value }}{{ else }}info{{ end }}"
+    template = "{{ $l := ToLower (or .json_level .lf_level .pg_level \"info\") }}{{ if or (eq $l \"information\") (eq $l \"notice\") (eq $l \"log\") }}info{{ else if eq $l \"warn\" }}warning{{ else if or (eq $l \"fatal\") (eq $l \"panic\") (eq $l \"critical\") (eq $l \"crit\") (eq $l \"eror\") }}error{{ else if or (eq $l \"trace\") (eq $l \"dbug\") }}debug{{ else }}{{ $l }}{{ end }}"
   }
   stage.labels {
     values = { level = "" }

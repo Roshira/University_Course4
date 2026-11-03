@@ -19,15 +19,17 @@ import uuid
 import pika
 import requests
 from opentelemetry import propagate, trace
+from opentelemetry.trace import SpanKind
 from opentelemetry.instrumentation.requests import RequestsInstrumentor
 from prometheus_client import Counter, Gauge, start_http_server
 
-from common.obs import log_extra, setup_logging, setup_tracing
+from common.obs import exit_on_sigterm, log_extra, setup_logging, setup_tracing
 
 SERVICE = "traffic-generator"
 log = setup_logging(SERVICE)
 tracer = setup_tracing(SERVICE)
 RequestsInstrumentor().instrument()
+exit_on_sigterm()
 
 API_URL = os.getenv("API_URL", "http://telemetry-api:8080")
 RABBIT_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@rabbitmq:5672/%2F")
@@ -99,6 +101,11 @@ class Publisher:
         self.ch = None
 
     def connect(self):
+        if self.conn is not None and self.conn.is_open:
+            try:
+                self.conn.close()
+            except pika.exceptions.AMQPError:
+                pass
         while True:
             try:
                 self.conn = pika.BlockingConnection(pika.URLParameters(RABBIT_URL))
@@ -107,23 +114,28 @@ class Publisher:
                 log.info("Connected to RabbitMQ", extra=log_extra(queue=QUEUE))
                 return
             except pika.exceptions.AMQPError as e:
-                log.warning(f"RabbitMQ not ready: {e}")
+                log.warning(f"RabbitMQ not ready: {e!r}")
                 time.sleep(3)
 
     def publish(self, event: dict):
-        headers: dict = {}
-        propagate.inject(headers)  # traceparent -> заголовки AMQP, consumer продовжить трейс
-        headers["x-sent-at"] = str(time.time())
-        try:
-            self.ch.basic_publish(
-                exchange="", routing_key=QUEUE, body=json.dumps(event, ensure_ascii=False).encode(),
-                properties=pika.BasicProperties(content_type="application/json", delivery_mode=2,
-                                                headers=headers))
-            EVENTS_PUBLISHED.labels(event["eventType"]).inc()
-        except pika.exceptions.AMQPError:
-            PUBLISH_ERRORS.inc()
-            log.exception("Publish failed, reconnecting")
-            self.connect()
+        body = json.dumps(event, ensure_ascii=False).encode()
+        # PRODUCER-спан: у графі сервісів Tempo з'являється зв'язок traffic-generator -> ingest-worker
+        with tracer.start_as_current_span(f"{QUEUE} publish", kind=SpanKind.PRODUCER) as span:
+            span.set_attribute("messaging.system", "rabbitmq")
+            span.set_attribute("messaging.destination.name", QUEUE)
+            headers: dict = {}
+            propagate.inject(headers)  # traceparent -> заголовки AMQP, consumer продовжить трейс
+            headers["x-sent-at"] = str(time.time())
+            props = pika.BasicProperties(content_type="application/json", delivery_mode=2, headers=headers)
+            for attempt in (1, 2):  # після перепідключення пробуємо ще раз, щоб подія не загубилась
+                try:
+                    self.ch.basic_publish(exchange="", routing_key=QUEUE, body=body, properties=props)
+                    EVENTS_PUBLISHED.labels(event["eventType"]).inc()
+                    return
+                except pika.exceptions.AMQPError as e:
+                    PUBLISH_ERRORS.inc()
+                    log.warning(f"Publish failed (attempt {attempt}), reconnecting: {e!r}")
+                    self.connect()
 
 
 # ---------------------------------------------------------------- simulation
@@ -137,6 +149,7 @@ def simulate_session(pub: Publisher, app_id: str):
         page = "/"
         steps = random.randint(1, 8)
         funnel_progress = 0
+        events = 0
         for _ in range(steps):
             base = {"appId": app_id, "sessionId": session_id, "url": page, "userAgent": USER_AGENTS[device]}
             pub.publish({**base, "eventType": "page_view", "elementTag": "Перегляд сторінки"})
@@ -147,11 +160,15 @@ def simulate_session(pub: Publisher, app_id: str):
             else:
                 button = random.choice(SITE[page])
             pub.publish({**base, "eventType": "click", "elementTag": button})
+            events += 2
             page = {"Каталог": "/catalog", "Додати в кошик": "/cart", "Оформити замовлення": "/checkout",
                     "Акції": "/sale", "Детальніше": "/product"}.get(button, random.choice(list(SITE)))
             if random.random() < 0.15:  # пішов з сайту
                 break
         span.set_attribute("session.funnel_progress", funnel_progress)
+        # рядок логу всередині спану містить trace_id: у Loki з нього можна перейти до наскрізного трейсу
+        log.info("Session published", extra=log_extra(
+            session_id=session_id, device=device, events=events, funnel_progress=funnel_progress))
 
 
 def analyst_loop(token: str):
@@ -193,7 +210,11 @@ def main():
         rate = current_rate(t0)
         CURRENT_RATE.set(rate)
         simulate_session(pub, app_id)
-        pub.conn.sleep(random.expovariate(rate))  # sleep, що обробляє heartbeat RabbitMQ
+        try:
+            pub.conn.sleep(random.expovariate(rate))  # sleep, що обробляє heartbeat RabbitMQ
+        except pika.exceptions.AMQPError as e:
+            log.warning(f"RabbitMQ connection lost: {e!r}")
+            pub.connect()
 
 
 if __name__ == "__main__":

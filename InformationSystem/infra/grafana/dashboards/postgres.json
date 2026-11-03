@@ -225,7 +225,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(rate(pg_stat_database_blks_hit{datname=\"telemetry\"}[5m])) / clamp_min(sum(rate(pg_stat_database_blks_hit{datname=\"telemetry\"}[5m])) + sum(rate(pg_stat_database_blks_read{datname=\"telemetry\"}[5m])), 1)",
+          "expr": "sum(rate(pg_stat_database_blks_hit{datname=\"telemetry\"}[5m])) / (sum(rate(pg_stat_database_blks_hit{datname=\"telemetry\"}[5m])) + sum(rate(pg_stat_database_blks_read{datname=\"telemetry\"}[5m])))",
           "legendFormat": "__auto",
           "range": false,
           "instant": true,

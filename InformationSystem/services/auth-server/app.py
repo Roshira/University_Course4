@@ -14,9 +14,11 @@ import hashlib
 import hmac
 import html
 import os
+import re
 import secrets
 import sqlite3
 import time
+import urllib.parse
 from contextlib import contextmanager
 
 import jwt
@@ -32,11 +34,12 @@ log = setup_logging(SERVICE)
 tracer = setup_tracing(SERVICE)
 
 DB_PATH = os.getenv("AUTH_DB_PATH", "/data/auth.db")
-SECRET = os.getenv("AUTH_SECRET") or secrets.token_hex(32)
 SESSION_TTL = int(os.getenv("SESSION_TTL_SECONDS", str(8 * 3600)))
 COOKIE = "obs_session"
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
 MAX_FAILS, FAIL_WINDOW = 5, 300
+LOGIN_EVENTS_TTL = 30 * 24 * 3600          # журнал входів зберігаємо 30 днів
+USERNAME_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
 ROLES = ("admin", "editor", "viewer")
 GRAFANA_ROLE = {"admin": "Admin", "editor": "Editor", "viewer": "Viewer"}
 
@@ -73,6 +76,27 @@ def check_password(password: str, stored: str) -> bool:
     except ValueError:
         return False
     return hmac.compare_digest(hash_password(password, bytes.fromhex(salt_hex)).split("$")[2], digest_hex)
+
+
+def load_secret() -> str:
+    """Ключ підпису JWT. Якщо AUTH_SECRET не задано, генеруємо випадковий і зберігаємо поруч із БД:
+    так немає публічного ключа "за замовчуванням", а сесії переживають перезапуск контейнера."""
+    if os.getenv("AUTH_SECRET"):
+        return os.environ["AUTH_SECRET"]
+    path = os.path.join(os.path.dirname(DB_PATH) or ".", "auth_secret")
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    if not os.path.exists(path):
+        with open(path, "w") as f:
+            f.write(secrets.token_hex(32))
+        os.chmod(path, 0o600)
+    with open(path) as f:
+        return f.read().strip()
+
+
+SECRET = load_secret()
+# фіктивний хеш: для неіснуючого логіна теж рахуємо PBKDF2, щоб за часом відповіді не можна було
+# дізнатися, які логіни існують
+DUMMY_HASH = hash_password(secrets.token_hex(8))
 
 
 def init_db():
@@ -139,7 +163,19 @@ def client_ip(request: Request) -> str:
 
 
 def safe_next(url: str | None) -> str:
-    return url if url and url.startswith("/") and not url.startswith("//") else "/"
+    """Дозволяємо лише відносні шляхи цього ж сайту: без //host, зворотних слешів і керуючих символів."""
+    if (url and url.startswith("/") and not url.startswith(("//", "/\\"))
+            and "\\" not in url and url.isprintable()):
+        return url
+    return "/"
+
+
+def same_origin(request: Request) -> bool:
+    """Захист від CSRF для форм адміністратора: запит має прийти зі сторінки цього ж сайту."""
+    origin = request.headers.get("origin") or request.headers.get("referer")
+    if not origin:
+        return False
+    return urllib.parse.urlsplit(origin).netloc == request.headers.get("host")
 
 
 # ------------------------------------------------------------------ HTML
@@ -183,6 +219,14 @@ def login_form(next_url: str, error: str = "", status: int = 200) -> HTMLRespons
 
 
 # ------------------------------------------------------------------ routes
+@app.get("/auth/start-login")
+def start_login(request: Request):
+    """nginx звертається сюди, коли запит без входу (error_page 401). Адресу, яку хотів відкрити
+    користувач, nginx передає в X-Original-URI як є ($request_uri); тут вона URL-кодується в next."""
+    original = safe_next(request.headers.get("x-original-uri"))
+    return RedirectResponse("/auth/login?next=" + urllib.parse.quote(original, safe=""), status_code=302)
+
+
 @app.get("/auth/login", response_class=HTMLResponse)
 def login_page(request: Request, next: str = "/"):
     if current_user(request):
@@ -193,16 +237,19 @@ def login_page(request: Request, next: str = "/"):
 @app.post("/auth/login")
 def login(request: Request, username: str = Form(...), password: str = Form(...), next: str = Form("/")):
     ip, now = client_ip(request), int(time.time())
+    username = username.strip()[:64]
     with db() as c:
-        fails = c.execute("SELECT count(*) FROM login_events WHERE username = ? AND success = 0 AND ts > ?",
-                          (username, now - FAIL_WINDOW)).fetchone()[0]
+        # блокуємо пару (логін, IP): так перебір паролів зупиняється, а заблокувати чужий акаунт
+        # (наприклад admin) з іншої адреси не вийде
+        fails = c.execute("SELECT count(*) FROM login_events WHERE username = ? AND ip = ? AND success = 0 AND ts > ?",
+                          (username, ip, now - FAIL_WINDOW)).fetchone()[0]
         if fails >= MAX_FAILS:
             LOGINS.labels("locked").inc()
             log.warning("Login blocked: too many failures", extra=log_extra(user=username, ip=ip))
             return login_form(safe_next(next), "Забагато невдалих спроб. Спробуйте через 5 хвилин.", 429)
 
         user = c.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
-        ok = bool(user) and check_password(password, user["password_hash"])
+        ok = check_password(password, user["password_hash"] if user else DUMMY_HASH) and bool(user)
         c.execute("INSERT INTO login_events (username, ip, success, ts) VALUES (?,?,?,?)",
                   (username, ip, int(ok), now))
         if not ok:
@@ -211,6 +258,9 @@ def login(request: Request, username: str = Form(...), password: str = Form(...)
             return login_form(safe_next(next), "Невірний логін або пароль", 401)
 
         sid = secrets.token_urlsafe(24)
+        # прибирання: прострочені сесії та старий журнал входів
+        c.execute("DELETE FROM sessions WHERE expires_at < ?", (now,))
+        c.execute("DELETE FROM login_events WHERE ts < ?", (now - LOGIN_EVENTS_TTL,))
         c.execute("INSERT INTO sessions (id, username, created_at, expires_at) VALUES (?,?,?,?)",
                   (sid, username, now, now + SESSION_TTL))
     token = jwt.encode({"sid": sid, "sub": username, "role": user["role"], "exp": now + SESSION_TTL},
@@ -287,7 +337,7 @@ def users_page(request: Request, msg: str = ""):
         f"<tr><td>{html.escape(u['username'])}</td><td>{u['role']}</td>"
         f"<td>{time.strftime('%Y-%m-%d %H:%M', time.localtime(u['created_at']))}</td><td>"
         + ("" if u["username"] == admin["username"] else
-           f"<form method='post' action='/auth/users/{html.escape(u['username'])}/delete' style='margin:0'>"
+           f"<form method='post' action='/auth/users/{urllib.parse.quote(u['username'])}/delete' style='margin:0'>"
            f"<button class='sm'>Видалити</button></form>")
         + "</td></tr>" for u in users)
     ev = "".join(
@@ -314,12 +364,15 @@ def create_user(request: Request, username: str = Form(...), password: str = For
     admin, denied = require_admin(request)
     if denied:
         return denied
-    if role not in ROLES or len(password) < 8 or not username.strip():
+    if not same_origin(request):
+        return Response("Запит не з цього сайту (CSRF)", status_code=403)
+    username = username.strip()
+    if role not in ROLES or len(password) < 8 or not USERNAME_RE.fullmatch(username):
         return RedirectResponse("/auth/users?msg=Некоректні+дані", status_code=303)
     try:
         with db() as c:
             c.execute("INSERT INTO users (username, password_hash, role, created_at) VALUES (?,?,?,?)",
-                      (username.strip(), hash_password(password), role, int(time.time())))
+                      (username, hash_password(password), role, int(time.time())))
     except sqlite3.IntegrityError:
         return RedirectResponse("/auth/users?msg=Такий+користувач+вже+існує", status_code=303)
     log.info("User created", extra=log_extra(user=username, role=role, by=admin["username"]))
@@ -332,6 +385,8 @@ def delete_user(request: Request, username: str):
     admin, denied = require_admin(request)
     if denied:
         return denied
+    if not same_origin(request):
+        return Response("Запит не з цього сайту (CSRF)", status_code=403)
     if username != admin["username"]:
         with db() as c:
             c.execute("DELETE FROM users WHERE username = ?", (username,))

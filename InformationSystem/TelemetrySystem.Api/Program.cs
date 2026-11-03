@@ -20,7 +20,7 @@ builder.Logging.ClearProviders();
 builder.Logging.AddJsonConsole(o =>
 {
     o.IncludeScopes = true;
-    o.TimestampFormat = "yyyy-MM-ddTHH:mm:ss.fffZ ";
+    o.TimestampFormat = "yyyy-MM-ddTHH:mm:ss.fffZ";
     o.UseUtcTimestamp = true;
 });
 
@@ -47,10 +47,14 @@ builder.Services.AddOpenTelemetry()
 builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseNpgsql(builder.Configuration.GetConnectionString("DefaultConnection")));
 
-builder.Services.AddSingleton(Channel.CreateBounded<EventData>(new BoundedChannelOptions(100000)
-{
-    FullMode = BoundedChannelFullMode.DropOldest
-}));
+// Черга між прийомом подій і записом у БД. Якщо БД не встигає і черга переповнена, найстаріші події
+// витісняються — рахуємо їх, щоб втрати було видно в Prometheus, а не лише в БД.
+var eventChannel = Channel.CreateBounded<EventData>(
+    new BoundedChannelOptions(100000) { FullMode = BoundedChannelFullMode.DropOldest },
+    _ => AppMetrics.EventsDropped.Inc());
+builder.Services.AddSingleton(eventChannel);
+// розмір черги читаємо в момент збору метрик Prometheus — значення завжди актуальне
+Metrics.DefaultRegistry.AddBeforeCollectCallback(() => AppMetrics.ChannelBacklog.Set(eventChannel.Reader.Count));
 
 builder.Services.AddHostedService<TelemetryWriterService>();
 builder.Services.AddScoped<IAnalyticsService, AnalyticsService>();
@@ -93,7 +97,7 @@ using (var scope = app.Services.CreateScope())
             db.Database.Migrate();
             break;
         }
-        catch (Exception ex) when (attempt < 10)
+        catch (Exception ex) when (attempt < 10 && ex is Npgsql.NpgsqlException or TimeoutException)
         {
             app.Logger.LogWarning(ex, "Database is not ready (attempt {Attempt}), retrying in 3s", attempt);
             Thread.Sleep(TimeSpan.FromSeconds(3));
@@ -101,7 +105,9 @@ using (var scope = app.Services.CreateScope())
     }
 }
 
-if (app.Environment.IsDevelopment())
+// Swagger курсової: у Development або явно через EnableSwagger=true (docker-compose працює в Production,
+// щоб назовні не віддавалися сторінки помилок зі стектрейсами).
+if (app.Environment.IsDevelopment() || app.Configuration.GetValue<bool>("EnableSwagger"))
 {
     app.UseSwagger();
     app.UseSwaggerUI();

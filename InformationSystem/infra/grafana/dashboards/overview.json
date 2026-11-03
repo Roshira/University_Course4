@@ -892,7 +892,7 @@
             "type": "loki",
             "uid": "loki"
           },
-          "expr": "{service=~\".+\", level=~\"error|critical|fatal|warning|warn\"}",
+          "expr": "{service=~\".+\", level=~\"error|warning\"}",
           "queryType": "range"
         }
       ],

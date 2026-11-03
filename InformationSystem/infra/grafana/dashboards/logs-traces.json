@@ -407,7 +407,7 @@
         "includeAll": true,
         "multi": true,
         "allValue": ".+",
-        "query": "error,warning,warn,info,information,debug",
+        "query": "error,warning,info,debug",
         "current": {
           "selected": true,
           "text": [

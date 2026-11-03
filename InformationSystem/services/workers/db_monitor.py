@@ -14,12 +14,13 @@ import psycopg2
 from opentelemetry.instrumentation.psycopg2 import Psycopg2Instrumentor
 from prometheus_client import Gauge, Histogram, start_http_server
 
-from common.obs import setup_logging, setup_tracing
+from common.obs import exit_on_sigterm, setup_logging, setup_tracing
 
 SERVICE = "db-monitor"
 log = setup_logging(SERVICE)
 tracer = setup_tracing(SERVICE)
 Psycopg2Instrumentor().instrument(skip_dep_check=True)  # psycopg2-binary
+exit_on_sigterm()
 
 DSN = os.getenv("DATABASE_DSN", "postgresql://postgres:postgres@postgres:5432/telemetry")
 INTERVAL = int(os.getenv("SCRAPE_INTERVAL", "15"))
@@ -41,7 +42,9 @@ IDX_SCANS = Gauge("db_table_idx_scans", "Кількість індексних �
 CONNECTIONS = Gauge("db_connections", "З'єднання за станом", ["state"])
 LONGEST_QUERY = Gauge("db_longest_running_query_seconds", "Найдовший активний запит")
 LOCKS_WAITING = Gauge("db_locks_waiting", "Кількість очікуваних блокувань")
-TOP_QUERIES_MEAN = Gauge("db_top_query_mean_ms", "Середній час топ-запитів (pg_stat_statements)", ["queryid", "query"])
+TOP_QUERIES_MEAN = Gauge("db_top_query_mean_ms",
+                         "Середній час запитів із топ-10 за сумарним часом (pg_stat_statements)",
+                         ["queryid", "query"])
 TOP_QUERIES_CALLS = Gauge("db_top_query_calls", "Кількість викликів топ-запитів", ["queryid", "query"])
 COLLECT_DURATION = Histogram("db_monitor_collect_seconds", "Час збору всіх метрик за один цикл")
 UP = Gauge("db_monitor_up", "1 якщо останній збір успішний")
@@ -80,10 +83,13 @@ def collect(conn):
                 GROUP BY 1 ORDER BY 2 DESC LIMIT 10'''))
             COMPANIES.set(fetch(cur, 'SELECT count(*) FROM "Companies"')[0][0])
 
-        for rel, size, live, dead, seq, idx in fetch(cur, '''
+        tables = fetch(cur, '''
                 SELECT relname, pg_total_relation_size(relid), n_live_tup, n_dead_tup,
                        seq_scan, coalesce(idx_scan, 0)
-                FROM pg_stat_user_tables'''):
+                FROM pg_stat_user_tables''')
+        for gauge in (TABLE_SIZE, TABLE_ROWS, DEAD_ROWS, SEQ_SCANS, IDX_SCANS):
+            gauge.clear()  # видалені таблиці не повинні лишатися в метриках
+        for rel, size, live, dead, seq, idx in tables:
             TABLE_SIZE.labels(rel).set(size)
             TABLE_ROWS.labels(rel).set(live)
             DEAD_ROWS.labels(rel).set(dead)
@@ -98,10 +104,13 @@ def collect(conn):
         LOCKS_WAITING.set(fetch(cur, "SELECT count(*) FROM pg_locks WHERE NOT granted")[0][0])
 
         if fetch(cur, "SELECT count(*) FROM pg_extension WHERE extname = 'pg_stat_statements'")[0][0]:
+            # Лише DML: у них pg_stat_statements замінює значення на $1, $2 ...
+            # Службові команди (CREATE ROLE ... PASSWORD '...') зберігаються дослівно і в метрики потрапити не повинні.
             rows = fetch(cur, '''
                 SELECT queryid, regexp_replace(query, '\\s+', ' ', 'g'), mean_exec_time, calls
                 FROM pg_stat_statements
                 WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+                  AND query ~* '^\\s*(select|insert|update|delete|with)\\M'
                 ORDER BY mean_exec_time * calls DESC LIMIT 10''')
             TOP_QUERIES_MEAN.clear()
             TOP_QUERIES_CALLS.clear()
@@ -116,14 +125,15 @@ def main():
     while True:
         try:
             if conn is None or conn.closed:
-                conn = psycopg2.connect(DSN)
+                # таймаути: моніторинг не повинен зависати разом із проблемною БД
+                conn = psycopg2.connect(DSN, connect_timeout=5, options="-c statement_timeout=10000")
                 conn.autocommit = True
                 log.info("Connected to PostgreSQL")
             collect(conn)
             UP.set(1)
-        except psycopg2.Error as e:
+        except Exception as e:  # будь-яка помилка збору не повинна зупиняти цикл моніторингу
             UP.set(0)
-            log.error(f"Failed to collect DB metrics: {e}")
+            log.error(f"Failed to collect DB metrics: {e!r}")
             try:
                 conn and conn.close()
             except psycopg2.Error:

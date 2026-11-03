@@ -10,7 +10,9 @@ datasources:
     jsonData:
       timeInterval: 10s
       exemplarTraceIdDestinations:
-        - name: trace_id
+        - name: trace_id        # exemplars prometheus-net
+          datasourceUid: tempo
+        - name: traceID         # exemplars span-metrics від Tempo
           datasourceUid: tempo
 
   - name: Loki

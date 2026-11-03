@@ -1,134 +1,197 @@
-# Система моніторингу роботи БД для AnalyticsSystem
+# Система моніторингу роботи БД
 
-Прикладна інформаційна система, яка отримує дані про роботу з базою даних, збирає метрики через **Prometheus**,
-логи через **Grafana Loki**, трейси через **Grafana Tempo** і відображає все це у **Grafana**.
-Доступ до системи мають лише авторизовані користувачі (власний **сервер авторизації на Python + SQLite**).
+Лабораторна робота з дисципліни «Інформаційні системи».
 
-За основу взято курсовий проєкт **AnalyticsSystem** (ASP.NET Core API + PostgreSQL), який збирає телеметрію
-відвідувачів сайтів (перегляди сторінок, кліки, воронки).
+Система збирає дані про роботу бази даних PostgreSQL і показує їх у **Grafana**:
+- **метрики** збирає **Prometheus** і зберігає у своїй вбудованій TSDB;
+- **логи** йдуть у **Grafana Loki**, **трейси** — у **Grafana Tempo**;
+- доступ мають лише користувачі, що увійшли через власний **сервер авторизації (Python + SQLite)**.
 
-## Архітектура
+Навантаження на БД створює курсовий проєкт **AnalyticsSystem** (ASP.NET Core + PostgreSQL) разом із Python-генератором відвідувачів сайту. Події між сервісами йдуть через **RabbitMQ**.
 
-```mermaid
-flowchart LR
-    subgraph Дані
-        GEN[traffic-generator<br/>Python] -- події --> MQ[(RabbitMQ<br/>telemetry.events)]
-        MQ --> CON[ingest-worker ×2<br/>Python]
-        CON -- POST /api/telemetry/track --> API[telemetry-api<br/>ASP.NET Core]
-        GEN -. GET /stats, /daily .-> API
-        API -- EF Core / Npgsql --> PG[(PostgreSQL 16)]
-    end
+Що саме і як зроблено, описано в [docs/DETAILS.md](docs/DETAILS.md).
 
-    subgraph Моніторинг
-        PGE[postgres-exporter] --> PG
-        DBM[db-monitor<br/>Python + SQL] --> PG
-        PROM[(Prometheus<br/>TSDB)]
-        LOKI[(Loki)]
-        TEMPO[(Tempo)]
-        ALLOY[Grafana Alloy] -- stdout контейнерів --> LOKI
-        GRAF[Grafana]
-    end
+---
 
-    PROM -- scrape /metrics --> API & CON & GEN & DBM & PGE & MQ & AUTH
-    API & CON & GEN & DBM & AUTH -- OTLP трейси --> TEMPO
-    TEMPO -- span-metrics, service graph --> PROM
-    GRAF --> PROM & LOKI & TEMPO & PG
+## 1. Що потрібно
 
-    USER((Користувач)) --> NGX[nginx gateway :8080]
-    NGX -- auth_request --> AUTH[auth-server<br/>Python + SQLite]
-    NGX --> GRAF
-```
+| Що | Примітка |
+|---|---|
+| **Docker Desktop** (Windows / macOS) або Docker Engine + Compose v2 (Linux) | Інше встановлювати не треба: .NET, Python, PostgreSQL тощо працюють у контейнерах |
+| Вільний порт **8080** | Інший порт можна задати в `.env`, див. розділ 7 |
+| ~4 ГБ RAM для Docker і ~5 ГБ на диску | Стек має 15 контейнерів |
+| Інтернет під час **першого** запуску | Docker завантажує образи, .NET- і Python-пакети |
 
-## Відповідність пунктам завдання
+## 2. Запуск
 
-| № | Вимога | Реалізація |
-|---|---|---|
-| 0 | СУБД у Docker | `postgres:16-alpine` з увімкненими `pg_stat_statements`, `track_io_timing`, логуванням повільних запитів (>200 мс) |
-| 1 | Генерація / актуалізація даних (Python) | `services/workers/generator.py` імітує відвідувачів інтернет-магазину (сесії, переходи по воронці «Каталог → Кошик → Оформлення → Оплата»), інтенсивність змінюється хвилею з випадковими сплесками. Дані потрапляють у БД через API курсової. Окремий потік імітує аналітика, який читає статистику (SELECT-навантаження) |
-| 2 | Збір даних — Prometheus | Збирає метрики 12 цілей: `postgres-exporter`, `db-monitor`, API, воркери, RabbitMQ, auth-server, сам стек моніторингу. Правила алертів лежать у `infra/prometheus/alerts.yml` |
-| 3 | Time Series Storage | Вбудована TSDB Prometheus у volume `prom-data`, дані зберігаються 15 днів |
-| 4 | Відображення — Grafana | 4 дашборди створюються автоматично (provisioning): **Огляд системи**, **PostgreSQL — робота СУБД**, **Аналітика сайту (дані з БД)**, **Логи і трейси** |
-| 5 | Логи — Grafana Loki | Grafana Alloy збирає stdout усіх контейнерів. Сервіси пишуть JSON-логи з `trace_id`, рівень логу стає лейблом. Із рядка логу можна одним кліком перейти до трейсу |
-| 6 | Трейси — Grafana Tempo | OpenTelemetry у C# (ASP.NET, HttpClient, SQL-запити Npgsql) і в Python. Контекст передається через заголовки RabbitMQ, тому один трейс проходить шлях **generator → RabbitMQ → worker → API → PostgreSQL**. Tempo будує з трейсів граф сервісів і RED-метрики |
-| 7 | Авторизація (Python + SQLite) | `services/auth-server`: FastAPI, SQLite (`users`, `sessions`, `login_events`), паролі хешуються через PBKDF2-SHA256, сесія зберігається в JWT-cookie з можливістю відкликання. Після 5 невдалих спроб за 5 хв вхід блокується. Ролі `admin`/`editor`/`viewer` передаються в Grafana. Є сторінка керування користувачами `/auth/users` |
-| 8 | Контейнеризація Docker | Увесь стек піднімається однією командою `docker compose up`. Назовні відкритий лише nginx |
-| 9 | Брокер повідомлень | RabbitMQ: durable-черга `telemetry.events`, повтори при помилках і dead-letter черга `telemetry.events.dead`. Consumer працює у двох репліках |
-| + | «Програмні методи моніторингу СУБД» | `services/workers/db_monitor.py` виконує SQL-запити до `pg_stat_activity`, `pg_stat_user_tables`, `pg_stat_statements`, `pg_locks` і віддає метрики: топ повільних запитів, розміри таблиць, мертві рядки, блокування, найдовший запит |
+Перед запуском **Docker Desktop має бути відкритий і запущений.**
 
-## Запуск
-
-Потрібен Docker Desktop (або Docker Engine + Compose v2).
+Отримати код (або розпакувати архів) і перейти в папку лабораторної:
 
 ```bash
-cp .env.example .env          # за потреби змініть паролі
-docker compose up -d --build  # перший запуск триває 3–5 хв (збірка .NET і Python образів)
+git clone https://github.com/Roshira/University_Course4.git
+cd University_Course4/InformationSystem
 ```
 
-Відкрийте **http://localhost:8080** → сторінка входу → `admin` / `admin12345`.
+**Windows** — з папки проєкту в PowerShell:
 
-| Адреса | Що там | Доступ |
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run.ps1
+```
+
+Скрипт створить `.env` (якщо його немає), збере й запустить контейнери і відкриє браузер.
+
+**Будь-яка ОС** — вручну:
+
+```bash
+cp .env.example .env
+docker compose up -d --build
+```
+
+Перший запуск займає кілька хвилин, бо збираються образи .NET і Python. Наступні запуски тривають секунди.
+
+Коли команда завершилась, **зачекайте ще ~1 хвилину**: сервіси підключаються одне до одного, а генератор накопичує перші дані. Поки цього не сталося, частина панелей може показувати «No data», це нормально.
+
+Перевірити, що всі контейнери працюють:
+
+```bash
+docker compose ps
+```
+
+Має бути 15 рядків зі статусом `Up` (у `postgres` і `rabbitmq` ще `(healthy)`). `ingest-worker` запущений у двох екземплярах.
+
+## 3. Вхід
+
+Відкрийте **http://localhost:8080**. Система перенаправить на сторінку входу.
+
+| Логін | Пароль |
+|---|---|
+| `admin` | `admin12345` |
+
+Логін і пароль задаються в `.env` (`ADMIN_USERNAME`, `ADMIN_PASSWORD`).
+
+Інші параметри `.env`:
+
+| Змінна | Призначення |
+|---|---|
+| `AUTH_SECRET` | ключ підпису сесій. Якщо порожній, `auth-server` сам згенерує випадковий ключ і збереже його у volume `auth-data` |
+| `GRAFANA_ADMIN_PASSWORD` | пароль вбудованого адміністратора Grafana. Увійти ним напряму не можна: вхід у Grafana лише через сервер авторизації |
+| `GRAFANA_DB_PASSWORD` | пароль користувача PostgreSQL `grafana_ro` (лише читання), під яким працюють Grafana, `db-monitor` і `postgres-exporter` |
+| `GENERATOR_SESSIONS_PER_SEC` | інтенсивність генератора навантаження |
+
+Після входу відкриється дашборд **«Огляд системи»**. Інші дашборди відкриваються кнопкою **«Дашборди»** вгорі праворуч або через меню Grafana: *Dashboards → Моніторинг БД*.
+
+| Адреса | Що там | Хто має доступ |
 |---|---|---|
-| `/` | Grafana | будь-який користувач |
-| `/auth/users` | керування користувачами, журнал входів | admin |
-| `/prometheus/` | Prometheus UI (Targets, Alerts, Graph) | admin |
-| `/rabbitmq/` | RabbitMQ Management (логін `telemetry`/`telemetry`) | admin |
-| `/swagger` | Swagger API курсової | відкрито |
-| `/auth/logout` | вихід | — |
+| http://localhost:8080/ | Grafana з 4 дашбордами | будь-який користувач після входу |
+| http://localhost:8080/auth/users | керування користувачами, журнал входів | admin |
+| http://localhost:8080/prometheus/ | Prometheus (Targets, Alerts, Graph) | admin |
+| http://localhost:8080/rabbitmq/ | RabbitMQ Management, далі ще логін `telemetry` / `telemetry` | admin |
+| http://localhost:8080/swagger | Swagger API курсової AnalyticsSystem (API працює в режимі Production, Swagger увімкнено окремим прапорцем `EnableSwagger`) | відкрито |
+| http://localhost:8080/auth/logout | вихід | — |
 
-Зупинка: `docker compose down`. Щоб видалити ще й усі дані: `docker compose down -v`.
+## 4. Як перевірити, що все працює (≈5 хвилин)
 
-## Що показати на захисті
+1. **Огляд системи** (відкривається першим):
+   - PostgreSQL = **UP**, Сервісів UP = **13**, Сервісів DOWN = **0**;
+   - «Запис у БД» — приблизно 20–40 подій/с;
+   - на графіку «Пропускна здатність конвеєра» три лінії йдуть разом: опубліковано → оброблено → записано в БД.
+2. **PostgreSQL — робота СУБД**: розмір БД, з'єднання, TPS, cache hit ratio, операції з рядками, розміри таблиць і таблиця «Топ-10 запитів за сумарним часом» (`pg_stat_statements`).
+3. **Аналітика сайту (дані з БД)**: топ кнопок, топ сторінок і воронка покупки. Нижні панелі читають дані **SQL-запитом напряму з PostgreSQL**.
+4. **Логи і трейси**:
+   - у полі «Пошук у тексті» введіть `Session published`;
+   - розгорніть будь-який рядок і натисніть **«Відкрити трейс»** біля поля TraceID;
+   - відкриється трейс у Tempo з повним шляхом події: `traffic-generator` → RabbitMQ → `ingest-worker` → `telemetry-api` → `telemetry.write` → SQL-запит у PostgreSQL.
 
-1. **Авторизація.** Відкрийте `localhost:8080`: система перенаправить на логін. Введіть неправильний пароль кілька разів,
-   і в дашборді «Огляд системи» з'явиться графік невдалих входів, а в Prometheus спрацює алерт `BruteForceSuspected`.
-   Створіть користувача з роллю `viewer` і покажіть, що він бачить дашборди, але `/prometheus/` для нього закритий.
-2. **Огляд системи.** На графіку «Пропускна здатність конвеєра» видно три лінії:
-   опубліковано → оброблено → записано в БД.
-3. **PostgreSQL.** Тут TPS, cache hit ratio, операції з рядками, розмір таблиць, мертві рядки
-   і **топ-10 запитів з `pg_stat_statements`**, серед яких видно INSERT від EF Core.
-4. **Аналітика сайту.** Тут топ кнопок, топ сторінок і воронка покупки. Частина панелей отримує дані
-   **SQL-запитом напряму з PostgreSQL** (користувач `grafana_ro` має право лише на читання).
-5. **Логи і трейси.** Відфільтруйте логи сервісу, розгорніть рядок і натисніть **TraceID**, щоб відкрити трейс у Tempo
-   зі спанами `generator.session → rabbitmq.consume → POST /api/telemetry/track → telemetry.write → INSERT`.
-   Також тут є граф сервісів (Node graph).
-6. **Відмовостійкість.** Виконайте `docker compose stop telemetry-api`. Черга в RabbitMQ почне рости,
-   спрацює алерт `QueueBacklog` / `ServiceDown`. Потім виконайте `docker compose start telemetry-api`:
-   накопичені повідомлення обробляться, і графік черги впаде до нуля.
+   Нижче на цьому дашборді граф сервісів, побудований з трейсів.
+5. **Prometheus**: http://localhost:8080/prometheus/targets — усі **13** цілей мають статус **UP**. На вкладці *Alerts* видно правила алертів.
+6. **Авторизація і ролі**:
+   - на http://localhost:8080/auth/users створіть користувача з роллю `viewer`;
+   - вийдіть (`/auth/logout`) і увійдіть як він;
+   - дашборди він бачить, а http://localhost:8080/prometheus/ — ні («Доступ заборонено»).
 
-## Структура
+   Якщо 5 разів поспіль ввести неправильний пароль, вхід для цього логіна з цієї IP-адреси блокується на 5 хвилин. На дашборді «Огляд системи» видно невдалі входи.
+7. **Відмовостійкість** (за бажанням):
+
+   ```bash
+   docker compose stop telemetry-api
+   ```
+
+   Через 30–60 с на графіку «Черги RabbitMQ» черга `telemetry.events` росте, а «Сервісів DOWN» стає 1. Тепер запустіть API знову:
+
+   ```bash
+   docker compose start telemetry-api
+   ```
+
+   Накопичені повідомлення обробляться за кілька секунд, черга впаде до нуля. Дані не втрачаються.
+
+## 5. Автоматичні тести
+
+Усі перевірки з розділу 4 (і ще багато інших) виконує скрипт. Потрібен лише Python 3.9+ без додаткових пакетів; стек має працювати щонайменше 2 хвилини.
+
+```bash
+python tests/integration_test.py
+```
+
+Параметри: `--base http://localhost:8081` (інший порт), `--user` і `--password` (інший адміністратор). На Windows, якщо в консолі «кракозябри», спочатку виконайте `set PYTHONIOENCODING=utf-8` (cmd) або `$env:PYTHONIOENCODING="utf-8"` (PowerShell).
+
+Скрипт робить 86 перевірок і в кінці друкує `Пройдено: N, не пройдено: M`:
+- **безпека:** редірект на вхід, підробка заголовка, CRLF-ін'єкція, відкритий редірект, CSRF, ролі admin/viewer, відкликання сесії, блокування після 5 невдалих входів;
+- **Prometheus:** усі цілі `up`, правила алертів, немає критичних алертів, термін зберігання;
+- **конвеєр даних:** події записуються в БД, швидкості публікації, обробки й запису збігаються, черги не ростуть, DLQ порожня;
+- **БД:** `grafana_ro` не може змінювати дані й не бачить хешів паролів, у метриках немає секретів;
+- **логи і трейси:** логи від усіх сервісів, нормалізовані рівні, наскрізний трейс від генератора до SQL, граф сервісів;
+- **Grafana:** джерела даних, 4 дашборди, **кожна панель** повертає дані.
+
+Тимчасовий користувач, якого створює тест, видаляється в кінці.
+
+**Unit-тести** (сервер авторизації — 13, обробник черги — 7, курсова — 5):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tests\run_unit_tests.ps1
+```
+
+Python-тести виконуються всередині вже зібраних образів стека, тому Python локально не потрібен. Для C#-тестів потрібен .NET 10 SDK; якщо його немає, скрипт їх пропускає.
+
+## 6. Зупинка
+
+```bash
+docker compose down        # зупинити, дані залишаються
+docker compose down -v     # зупинити і видалити всі дані (БД, метрики, логи, користувачів)
+```
+
+## 7. Якщо щось не так
+
+| Проблема | Що зробити |
+|---|---|
+| `port is already allocated` / 8080 зайнятий | У `.env` задайте `GATEWAY_PORT=8081` і запустіть `docker compose up -d` знову. Адреса стане http://localhost:8081 |
+| `docker: command not found` або `Cannot connect to the Docker daemon` | Запустіть Docker Desktop і дочекайтеся статусу *Engine running* |
+| Панелі показують «No data» | Зачекайте 1–2 хвилини після запуску. Перевірте `docker compose ps`: усі сервіси мають бути `Up` |
+| Не підходить пароль адміністратора після зміни `.env` | Адміністратор створюється лише при першому запуску. Щоб застосувати новий пароль, видаліть дані: `docker compose down -v`, потім `docker compose up -d` |
+| Змінили `GRAFANA_DB_PASSWORD` або `POSTGRES_*`, і Grafana / `db-monitor` не підключаються до БД | Init-скрипт PostgreSQL виконується лише на порожній БД. Або видаліть дані (`docker compose down -v`), або застосуйте скрипт повторно: `docker compose exec -T postgres sh /docker-entrypoint-initdb.d/10-init.sh` (у Git Bash додайте спереду `MSYS_NO_PATHCONV=1`) |
+| Потрібна сторінка помилок ASP.NET з деталями | API навмисно запущено в режимі Production. Для налагодження задайте `ASPNETCORE_ENVIRONMENT: Development` у `docker-compose.yml` |
+| Сервіс постійно перезапускається | Подивіться його лог: `docker compose logs --tail 100 <сервіс>`, наприклад `telemetry-api` |
+| Мало пам'яті, контейнери падають | Docker Desktop → Settings → Resources: дайте Docker щонайменше 4 ГБ RAM |
+| У Grafana → Connections → Tempo кнопка «Test» пише «Method not implemented» | Це нормально для Tempo в Grafana 11: перевірка зв'язку не реалізована, трейси при цьому працюють |
+
+## 8. Структура проєкту
 
 ```
-docker-compose.yml           — увесь стек
-TelemetrySystem.Api/         — курсова (ASP.NET Core) + Dockerfile, /metrics, OpenTelemetry, JSON-логи
-  Observability/AppMetrics.cs  — власні метрики (події, помилки запису, тривалість INSERT, черга)
+docker-compose.yml        увесь стек (15 контейнерів)
+run.ps1                   запуск на Windows
+.env.example              паролі та налаштування
+TelemetrySystem.Api/      курсова AnalyticsSystem (ASP.NET Core) + метрики, трейси, JSON-логи
+TelemetrySystem.Api.Tests/ unit-тести курсової
+telemetry-dashboard/      фронтенд курсової (Angular), у стеку не запускається
 services/
-  common/obs.py              — спільне налаштування логів (JSON + trace_id) і трейсів для Python
-  workers/generator.py       — генератор даних -> RabbitMQ
-  workers/consumer.py        — RabbitMQ -> API (повтори, DLQ)
-  workers/db_monitor.py      — програмний моніторинг PostgreSQL
-  auth-server/app.py         — сервер авторизації (FastAPI + SQLite)
-infra/
-  nginx/        — gateway + auth_request
-  prometheus/   — scrape-конфіг, алерти
-  loki/ tempo/ alloy/        — логи й трейси
-  grafana/      — datasources і дашборди (provisioning)
-  postgres/     — init-скрипт (pg_stat_statements, read-only користувач)
-  rabbitmq/     — плагіни Prometheus і management, path_prefix
+  workers/generator.py    генерація даних -> RabbitMQ
+  workers/consumer.py     RabbitMQ -> API -> PostgreSQL
+  workers/db_monitor.py   програмний моніторинг PostgreSQL (SQL до pg_stat_*)
+  auth-server/app.py      сервер авторизації (FastAPI + SQLite)
+  common/obs.py           спільні налаштування логів і трейсів для Python
+  */tests/                unit-тести Python-сервісів
+infra/                    конфігурації nginx, Prometheus, Loki, Tempo, Alloy, Grafana, PostgreSQL, RabbitMQ
+tests/integration_test.py інтеграційний тест усього стека (86 перевірок)
+tests/run_unit_tests.ps1  запуск усіх unit-тестів
+docs/DETAILS.md           детальний опис роботи
 ```
-
-## Метрики, додані в проєкт
-
-| Метрика | Джерело | Опис |
-|---|---|---|
-| `telemetry_events_received_total{event_type}` | API | прийняті події |
-| `telemetry_events_written_total`, `telemetry_events_write_errors_total` | API | записи в БД і помилки |
-| `telemetry_db_write_duration_seconds` | API | гістограма тривалості INSERT |
-| `telemetry_channel_backlog` | API | внутрішня черга перед записом |
-| `http_request_duration_seconds` | API | латентність HTTP (prometheus-net) |
-| `generator_events_published_total`, `generator_sessions_total{device}` | generator | згенероване навантаження |
-| `consumer_messages_processed_total{result}`, `consumer_end_to_end_seconds` | worker | обробка черги, затримка від публікації до запису |
-| `app_events_total`, `app_events_last_minute`, `app_top_*` | db-monitor | бізнес-дані з таблиць |
-| `db_top_query_mean_ms`, `db_table_*`, `db_connections`, `db_locks_waiting` | db-monitor | стан СУБД |
-| `pg_stat_database_*`, `pg_database_size_bytes` | postgres-exporter | стандартні метрики PostgreSQL |
-| `auth_logins_total{result}`, `auth_active_sessions` | auth-server | безпека |
-| `traces_spanmetrics_*`, `traces_service_graph_*` | Tempo | RED-метрики з трейсів |
