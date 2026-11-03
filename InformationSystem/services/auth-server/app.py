@@ -47,6 +47,11 @@ LOGINS = Counter("auth_logins_total", "Спроби входу", ["result"])
 VERIFY = Counter("auth_verify_total", "Перевірки доступу від nginx", ["result"])
 USERS = Gauge("auth_users_total", "Кількість користувачів")
 ACTIVE_SESSIONS = Gauge("auth_active_sessions", "Активні (не відкликані й не прострочені) сесії")
+# серії з нулем одразу після старту, інакше increase() не бачить першого входу
+for _result in ("success", "failure", "locked"):
+    LOGINS.labels(_result)
+for _result in ("ok", "unauthorized", "forbidden"):
+    VERIFY.labels(_result)
 
 app = FastAPI(title="Observability Auth Server", docs_url=None, redoc_url=None)
 FastAPIInstrumentor.instrument_app(app, excluded_urls="metrics,auth/verify")
